@@ -324,6 +324,20 @@ const schoolLayer  = L.layerGroup().addTo(map);  // school shapes + markers
 const selected = new Set(STATIONS.map((_, i) => i));   // all stations start selected
 const stationMarkers = [];
 
+/* persist selection by name (stable if STATIONS is reordered/edited later) */
+try{
+  const savedSel = localStorage.getItem("cc_selected_stations");
+  if(savedSel){
+    const names = new Set(JSON.parse(savedSel));
+    selected.clear();
+    STATIONS.forEach((s, i) => { if(names.has(s.name)) selected.add(i); });
+  }
+}catch(e){ /* storage unavailable (private mode / sandbox) — selection just won't persist */ }
+function persistStations(){
+  try{ localStorage.setItem("cc_selected_stations", JSON.stringify([...selected].map(i => STATIONS[i].name))); }
+  catch(e){}
+}
+
 function stationStyleFor(i){
   const on = selected.has(i);
   return {
@@ -387,7 +401,7 @@ function buildStationList(){
       const lab = document.createElement("label");
       lab.className = "stitem";
       const cb = document.createElement("input");
-      cb.type = "checkbox"; cb.checked = true; cb.dataset.idx = i;
+      cb.type = "checkbox"; cb.checked = selected.has(i); cb.dataset.idx = i;
       cb.addEventListener("change", () => toggleStation(i, cb.checked));
       lab.appendChild(cb);
       lab.append(" " + STATIONS[i].name);
@@ -426,6 +440,7 @@ function toggleStation(i, force){
   drawExits();
   renderMetro();
   notifyMissing();
+  persistStations();
 }
 
 function setAllStations(on){
@@ -436,6 +451,7 @@ function setAllStations(on){
   drawExits();
   renderMetro();
   notifyMissing();
+  persistStations();
 }
 
 function notifyMissing(){
