@@ -213,7 +213,8 @@
 
   <section>
     <h2>1 · Metro coverage</h2>
-    <label for="minsRange" style="margin-top:0">Walking time to a station: <b id="minsVal" style="color:var(--panel-text)">15</b> min</label>
+    <label class="check" style="margin-top:0"><input type="checkbox" id="metroWalkToggle" checked> Show walk area for selected stations</label>
+    <label for="minsRange" style="margin-top:10px">Walking time to a station: <b id="minsVal" style="color:var(--panel-text)">15</b> min</label>
     <input type="range" id="minsRange" min="5" max="15" step="2" value="15" aria-label="Walking time in minutes">
     <div class="status" id="metroStatus"></div>
     <p class="hint">Baked walking-network isochrones for every station at 5/7/9/11/13/15 min — no API key or waiting, the slider snaps to whichever of those is closest.</p>
@@ -531,6 +532,7 @@ drawExits();
 /* ---------- Metro coverage ---------- */
 const metroStatus = document.getElementById("metroStatus");
 const mergeToggle = document.getElementById("mergeToggle");
+const metroWalkToggle = document.getElementById("metroWalkToggle");
 
 /* --- ORS key persistence (used only by the custom-address walkshed below;
    works hosted or opened locally; sandboxed previews ignore it) --- */
@@ -578,7 +580,7 @@ let schoolCoverage = null;  // school-walkshed coverage {feat: <turf Feature>}, 
 function renderMetro(){
   metroLayer.clearLayers();
   coverage = null;
-  if(WALKSHEDS){
+  if(WALKSHEDS && metroWalkToggle.checked){
     const t = String(walkMinutes);
     const feats = [...selected].map(i => {
       const byTime = WALKSHEDS.stations[STATIONS[i].name];
@@ -593,6 +595,7 @@ function renderMetro(){
   }
   setStatus(metroStatus,
     !WALKSHEDS ? "Loading baked walksheds…" :
+    !metroWalkToggle.checked ? "Metro walk area hidden." :
     selected.size === 0 ? "No stations selected." :
     `${selected.size} station${selected.size > 1 ? "s" : ""} selected · ${walkMinutes} min walk (baked).`,
     coverage ? "ok" : "");
@@ -633,6 +636,7 @@ minsRange.addEventListener("input", () => {
 });
 
 mergeToggle.addEventListener("change", renderMetro);
+metroWalkToggle.addEventListener("change", renderMetro);
 document.getElementById("stationToggle").addEventListener("change", e => {
   if(e.target.checked) stationLayer.addTo(map); else map.removeLayer(stationLayer);
 });
