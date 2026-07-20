@@ -279,7 +279,8 @@
   <section>
     <h2>7 · Neighborhood texture</h2>
     <label class="check" style="margin-top:0"><input type="checkbox" id="hexMeshToggle"> Show 300 m hex mesh</label>
-    <p class="hint">2,340 hexagons scored on greenness, crowding, traffic edge, park reach, air and built cover — each layer button below is its own legend (ramp, scale, and which direction is better). Hover a cell for the full readout, click to lock it. With a viable home zone active (section 5), the mesh clips to just that area.</p>
+    <label class="check"><input type="checkbox" id="hideWalkshedColors"> No walkshed overlap — hide zone/metro/school colors</label>
+    <p class="hint">2,340 hexagons scored on greenness, crowding, traffic edge, park reach, air and built cover — each layer button below is its own legend (ramp, scale, and which direction is better). Hover a cell for the full readout, click to lock it. With a viable home zone active (section 5), the mesh clips to just that area. The mesh's own colors always render above the zone/metro/school walkshed fills; tick the box above for a completely clean view with those hidden entirely.</p>
     <div id="hexLayers" style="margin-top:10px"></div>
     <label class="check"><input type="checkbox" id="hexWeaveToggle"> Show the livability weave instead</label>
     <div id="hexWeights"></div>
@@ -387,6 +388,15 @@ addBaseLayer();
 setTimeout(() => map.invalidateSize(), 250);
 window.addEventListener("load",  () => map.invalidateSize());
 window.addEventListener("resize", () => map.invalidateSize());
+
+/* Coverage fills (metro/school-walkshed/zone) live in their own pane so the
+   hex mesh's pane (created below, higher z) can sit visually above them —
+   otherwise the mesh's greenness/crowding/etc colors get washed out by
+   the zone/walkshed colors on top. Markers stay in the default overlayPane
+   (z 400), above both, so they're never hidden. */
+map.createPane("coveragePane");
+map.getPane("coveragePane").style.zIndex = 390;
+const coveragePaneOpt = {pane: "coveragePane"};
 
 const metroLayer     = L.layerGroup().addTo(map);  // baked metro walkshed union (blue)
 const stationLayer   = L.layerGroup().addTo(map);  // station dots
@@ -589,8 +599,8 @@ function renderMetro(){
     if(feats.length){
       const merged = unionFeats(feats);
       coverage = {feat: merged};
-      if(mergeToggle.checked) L.geoJSON(merged, {style: mergedStyle}).addTo(metroLayer);
-      else L.geoJSON({type:"FeatureCollection", features: feats}, {style: metroStyle}).addTo(metroLayer);
+      if(mergeToggle.checked) L.geoJSON(merged, {...coveragePaneOpt, style: mergedStyle}).addTo(metroLayer);
+      else L.geoJSON({type:"FeatureCollection", features: feats}, {...coveragePaneOpt, style: metroStyle}).addTo(metroLayer);
     }
   }
   setStatus(metroStatus,
@@ -842,7 +852,7 @@ function renderSchoolWalkshed(){
   if(feats.length){
     const merged = unionFeats(feats);
     schoolCoverage = {feat: merged};
-    L.geoJSON(merged, {style: schoolWalkMergedStyle}).addTo(schoolWalkLayer);
+    L.geoJSON(merged, {...coveragePaneOpt, style: schoolWalkMergedStyle}).addTo(schoolWalkLayer);
   }
   afterCoverageChange();
 }
@@ -881,7 +891,7 @@ function renderZone(){
     coverage ? "Metro walkshed only (school walkshed off)." :
     "School walkshed only (no stations selected).";
   if(zoneToggle.checked && zoneCoverage){
-    L.geoJSON(zoneCoverage.feat, {style: zoneStyle}).addTo(zoneLayer);
+    L.geoJSON(zoneCoverage.feat, {...coveragePaneOpt, style: zoneStyle}).addTo(zoneLayer);
   }
 }
 
@@ -986,10 +996,12 @@ function cellColor(row){
   return rampColor(L.ramp, t);
 }
 
-/* ---- dedicated pane: above tiles, below every other overlay (stations,
-   exits, schools, walksheds all use Leaflet's default overlayPane) ---- */
+/* ---- dedicated pane: above tiles AND above coveragePane (zone/metro/school
+   walkshed fills, z 390), so the mesh's own colors stay legible instead of
+   being washed out by them — but below the default overlayPane (z 400),
+   so markers (stations, exits, schools) always stay on top and clickable. */
 map.createPane('hexPane');
-map.getPane('hexPane').style.zIndex = 350;
+map.getPane('hexPane').style.zIndex = 395;
 const hexLayer = L.layerGroup();   // NOT added to map yet — mesh starts off
 
 /* ---- state ---- */
@@ -1107,6 +1119,13 @@ document.getElementById("hexWeaveToggle").addEventListener("change", e => {
   hexWeaveOn = e.target.checked;
   syncHexActive();
   if(hexMeshOn) renderMesh();
+});
+
+/* Pure display toggle — hides the zone/metro/school-walkshed fills (all
+   in coveragePane) without touching their own toggles or computed
+   coverage, so nothing else about their state changes. */
+document.getElementById("hideWalkshedColors").addEventListener("change", e => {
+  map.getPane("coveragePane").style.display = e.target.checked ? "none" : "";
 });
 </script>
 
