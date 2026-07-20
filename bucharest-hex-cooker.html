@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>București hex cooker — neighborhood quality data</title>
+<script src="https://unpkg.com/geotiff@2.1.3/dist-browser/geotiff.js"></script>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:880px;margin:24px auto;padding:0 16px;color:#1b2430;background:#f7f5f0}
+  h1{font-size:22px} h2{font-size:16px;margin-top:22px}
+  .step{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px 16px;margin:10px 0}
+  .step.done{border-color:#3fa757;background:#f4faf5}
+  button{padding:8px 14px;border-radius:8px;border:none;background:#2563eb;color:#fff;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .drop{border:2px dashed #aaa;border-radius:10px;padding:18px;text-align:center;color:#667;margin-top:8px}
+  .drop.over{border-color:#2563eb;background:#eef4ff}
+  #log{background:#0d2440;color:#cfe3ff;font:12px/1.5 ui-monospace,monospace;border-radius:10px;padding:12px;height:220px;overflow-y:auto;white-space:pre-wrap;margin-top:16px}
+  .hint{font-size:12.5px;color:#667;line-height:1.5}
+  .ok{color:#1c7f3b;font-weight:600}
+</style>
+</head>
+<body>
+<h1>București hex cooker</h1>
+<p class="hint">Computes neighborhood-quality metrics for a ~300 m hex grid over Bucharest and downloads <b>hexes.json</b>.
+Steps 1–2 fetch live data (OpenStreetMap, Sentinel-2). Steps 3–4 read rasters you download once yourself.
+Data credits: © OpenStreetMap contributors (ODbL) · Copernicus Sentinel-2 · EEA (CC-BY 4.0) · WorldPop (CC-BY 4.0).</p>
+
+<div class="step" id="s0"><b>0 · Hex grid</b> — <span id="s0i">not built</span><br><button onclick="buildGrid()">Build grid</button></div>
+<div class="step" id="s1"><b>1 · OSM roads & parks</b> (live, ~30 s) — <span id="s1i">waiting</span><br><button onclick="fetchOSM()" id="b1" disabled>Fetch from Overpass</button></div>
+<div class="step" id="s2"><b>2 · NDVI</b> (live Sentinel-2, ~1 min) — <span id="s2i">waiting</span><br><button onclick="fetchNDVI()" id="b2" disabled>Fetch & compute NDVI</button></div>
+<div class="step" id="s3"><b>3 · EEA air quality raster(s)</b> — <span id="s3i">waiting</span>
+  <p class="hint">Download <code>pm25_avg24_int.tif</code> (74 MB) from the EEA datastore
+  (<a href="https://sdi.eea.europa.eu/datastore/public?path=%2Feea_r_3035_1_km_aq-interpolated-pm25_p_2024_v00_r00" target="_blank">this folder</a>),
+  and optionally the NO2 sibling (search the catalogue for “NO2 interpolated 2024”). Drop the .tif file(s) below — filenames containing
+  <code>pm25</code>/<code>pm2_5</code> or <code>no2</code> are auto-detected. EPSG:3035, 1 km.</p>
+  <div class="drop" id="dropEEA">drop EEA .tif here</div></div>
+<div class="step" id="s4"><b>4 · Population raster</b> (optional but recommended) — <span id="s4i">waiting</span>
+  <p class="hint">Download the Romania 100 m population GeoTIFF from
+  <a href="https://www.worldpop.org" target="_blank">worldpop.org</a> (Population Counts → Constrained → Romania) and drop it below.
+  Must be EPSG:4326 (WorldPop default). LZW/Deflate compression handled.</p>
+  <div class="drop" id="dropPop">drop population .tif here</div></div>
+<div class="step" id="s5"><b>5 · Export</b> — <span id="s5i">waiting</span><br><button onclick="exportJSON()" id="b5" disabled>Compute remaining metrics & download hexes.json</button></div>
+
+<div id="log"></div>
+
+<script>
+"use strict";
+/* ================= config ================= */
+const BBOX = {S:44.335, N:44.545, W:25.955, E:26.245};    // Bucharest + margin
+const HEXR = 300;                                          // m, center→vertex
+const LAT0 = (BBOX.S+BBOX.N)/2, LON0 = (BBOX.W+BBOX.E)/2;
+const KX = 111320*Math.cos(LAT0*Math.PI/180), KY = 110540;
+const log = m => { const el=document.getElementById("log"); el.textContent += m+"\n"; el.scrollTop=el.scrollHeight; };
+const setI = (id,msg,done) => { document.getElementById(id+"i").innerHTML = msg; if(done) document.getElementById(id).classList.add("done"); };
+
+/* ================= state ================= */
+let HEX = [];            // {lat,lng,x,y, ndvi,pop,art,park,pm25,no2}
+let ROADS = null, PARKS = null;
+
+/* ================= grid ================= */
+const local = (lat,lon) => [(lon-LON0)*KX, (lat-LAT0)*KY];
+const unlocal = (x,y) => [LAT0 + y/KY, LON0 + x/KX];
+const HEXV = []; for(let a=0;a<6;a++) HEXV.push([HEXR*Math.cos(a*Math.PI/3), HEXR*Math.sin(a*Math.PI/3)]);
+const S3 = Math.sqrt(3);
+const inHex = (dx,dy) =>            // flat-top hex, circumradius HEXR, relative to center
+  Math.abs(dy) <= S3/2*HEXR + 0.1 && S3*Math.abs(dx) + Math.abs(dy) <= S3*HEXR + 0.1;
+function buildGrid(){
+  HEX = [];
+  const [minx, miny] = local(BBOX.S, BBOX.W), [maxx, maxy] = local(BBOX.N, BBOX.E);
+  const dx = 1.5*HEXR, dy = Math.sqrt(3)*HEXR;
+  let colI = 0;
+  for(let x = minx; x <= maxx; x += dx, colI++){
+    const off = (colI % 2) ? dy/2 : 0;
+    for(let y = miny + off; y <= maxy; y += dy){
+      const [lat, lng] = unlocal(x, y);
+      HEX.push({lat:+lat.toFixed(6), lng:+lng.toFixed(6), x, y});
+    }
+  }
+  setI("s0", "<span class=ok>"+HEX.length+" hexes</span>", true);
+  log("grid: "+HEX.length+" hexes, R="+HEXR+" m");
+  document.getElementById("b1").disabled = false;
+  document.getElementById("b2").disabled = false;
+  document.getElementById("b5").disabled = false;
+}
+
+/* ================= spatial buckets ================= */
+function bucketize(segs, cell){      // segs: [x1,y1,x2,y2]
+  const B = new Map();
+  const key = (i,j) => i+"_"+j;
+  segs.forEach((s,si) => {
+    const i0=Math.floor(Math.min(s[0],s[2])/cell), i1=Math.floor(Math.max(s[0],s[2])/cell);
+    const j0=Math.floor(Math.min(s[1],s[3])/cell), j1=Math.floor(Math.max(s[1],s[3])/cell);
+    for(let i=i0;i<=i1;i++) for(let j=j0;j<=j1;j++){
+      const k = key(i,j); if(!B.has(k)) B.set(k, []); B.get(k).push(si);
+    }
+  });
+  return {B, cell, key, segs};
+}
+function nearestSegDist(bk, x, y, maxD){
+  const c = bk.cell, r = Math.ceil(maxD/c);
+  const ci = Math.floor(x/c), cj = Math.floor(y/c);
+  let best = maxD;
+  const seen = new Set();
+  for(let i=ci-r;i<=ci+r;i++) for(let j=cj-r;j<=cj+r;j++){
+    const ids = bk.B.get(bk.key(i,j)); if(!ids) continue;
+    for(const id of ids){
+      if(seen.has(id)) continue; seen.add(id);
+      const s = bk.segs[id];
+      const ddx=s[2]-s[0], ddy=s[3]-s[1];
+      const t=Math.max(0,Math.min(1,((x-s[0])*ddx+(y-s[1])*ddy)/(ddx*ddx+ddy*ddy||1)));
+      const d=Math.hypot(s[0]+t*ddx-x, s[1]+t*ddy-y);
+      if(d<best) best=d;
+    }
+  }
+  return best;
+}
+
+/* ================= step 1: OSM ================= */
+async function fetchOSM(){
+  document.getElementById("b1").disabled = true;
+  setI("s1","fetching…");
+  const bb = `(${BBOX.S},${BBOX.W},${BBOX.N},${BBOX.E})`;
+  const q = `[out:json][timeout:90];(
+way["highway"~"^(motorway|trunk|primary|secondary)$"]${bb};
+way["leisure"~"^(park|garden)$"]${bb};
+way["landuse"~"^(forest|village_green|recreation_ground)$"]${bb};
+way["natural"="wood"]${bb};
+);out geom;`;
+  try{
+    let txt;
+    for(let att=0; att<3; att++){
+      const r = await fetch("https://overpass-api.de/api/interpreter", {method:"POST",
+        body:"data="+encodeURIComponent(q), headers:{"Content-Type":"application/x-www-form-urlencoded"}});
+      txt = await r.text();
+      if(!txt.trimStart().startsWith("<")) break;
+      log("overpass busy, retrying…"); await new Promise(r=>setTimeout(r,5000));
+    }
+    const data = JSON.parse(txt);
+    const roadSegs = [], parkSegs = [];
+    let nRoads=0, nParks=0;
+    for(const e of data.elements){
+      if(e.type!=="way" || !e.geometry) continue;
+      const pts = e.geometry.map(g => local(g.lat, g.lon));
+      if(e.tags.highway){
+        nRoads++;
+        for(let i=1;i<pts.length;i++) roadSegs.push([pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1]]);
+      }else{
+        // park polygon: keep only ≥1 ha
+        let a=0; for(let i=0,j=pts.length-1;i<pts.length;j=i++) a+=(pts[j][0]+pts[i][0])*(pts[j][1]-pts[i][1]);
+        if(Math.abs(a/2) < 10000) continue;
+        nParks++;
+        for(let i=1;i<pts.length;i++) parkSegs.push([pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1]]);
+      }
+    }
+    ROADS = bucketize(roadSegs, 500);
+    PARKS = bucketize(parkSegs, 500);
+    setI("s1", `<span class=ok>${nRoads} arterial ways, ${nParks} parks ≥1 ha</span>`, true);
+    log(`osm: ${roadSegs.length} road segs, ${parkSegs.length} park-edge segs`);
+  }catch(e){ setI("s1","failed: "+e); log("OSM error: "+e); document.getElementById("b1").disabled=false; }
+}
+
+/* ================= step 2: NDVI ================= */
+const toUTM = (lat, lon) => {
+  const a=6378137, f=1/298.257223563, k0=0.9996;
+  const e2=f*(2-f), ep2=e2/(1-e2), l0=27*Math.PI/180;
+  const p=lat*Math.PI/180, l=lon*Math.PI/180;
+  const N=a/Math.sqrt(1-e2*Math.sin(p)**2), T=Math.tan(p)**2, C=ep2*Math.cos(p)**2, A=Math.cos(p)*(l-l0);
+  const e4=e2*e2, e6=e4*e2;
+  const M=a*((1-e2/4-3*e4/64-5*e6/256)*p-(3*e2/8+3*e4/32+45*e6/1024)*Math.sin(2*p)+(15*e4/256+45*e6/1024)*Math.sin(4*p)-(35*e6/3072)*Math.sin(6*p));
+  return [k0*N*(A+(1-T+C)*A**3/6+(5-18*T+T*T+72*C-58*ep2)*A**5/120)+500000,
+          k0*(M+N*Math.tan(p)*(A*A/2+(5-T+9*C+4*C*C)*A**4/24+(61-58*T+T*T+600*C-330*ep2)*A**6/720))];
+};
+async function fetchNDVI(){
+  document.getElementById("b2").disabled = true;
+  setI("s2","searching scene…");
+  try{
+    const search = await (await fetch("https://earth-search.aws.element84.com/v1/search",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({collections:["sentinel-2-l2a"],
+        intersects:{type:"Point",coordinates:[LON0,LAT0]},
+        datetime:"2026-04-01T00:00:00Z/2026-12-31T00:00:00Z",
+        query:{"eo:cloud_cover":{"lt":12}},
+        sortby:[{field:"properties.eo:cloud_cover",direction:"asc"}], limit:3})})).json();
+    if(!search.features.length) throw new Error("no cloud-free scene found");
+    const it = search.features[0];
+    log("scene "+it.id+" cloud "+it.properties["eo:cloud_cover"].toFixed(2)+"%");
+    setI("s2","reading rasters…");
+    const openBand = async href => {
+      const t = await GeoTIFF.fromUrl(href);
+      const full = await t.getImage(0);
+      const n = await t.getImageCount();
+      let img = full, res = 10;
+      for(let i=1;i<n;i++){
+        const im = await t.getImage(i);
+        const r = 10*full.getWidth()/im.getWidth();
+        if(r <= 45){ img = im; res = r; }
+      }
+      return {img, res, full};
+    };
+    const Rb = await openBand(it.assets.red.href);
+    const Nb = await openBand(it.assets.nir.href);
+    const corners = [[BBOX.S,BBOX.W],[BBOX.S,BBOX.E],[BBOX.N,BBOX.W],[BBOX.N,BBOX.E]].map(c=>toUTM(c[0],c[1]));
+    const minE=Math.min(...corners.map(c=>c[0]))-400, maxE=Math.max(...corners.map(c=>c[0]))+400;
+    const minN=Math.min(...corners.map(c=>c[1]))-400, maxN=Math.max(...corners.map(c=>c[1]))+400;
+    const [ox,oy] = Rb.full.getOrigin();
+    const px = v => Math.floor((v-ox)/Rb.res), py = v => Math.floor((oy-v)/Rb.res);
+    const win = [px(minE), py(maxN), px(maxE)+1, py(minN)+1];
+    const w = win[2]-win[0], h = win[3]-win[1];
+    log(`ndvi window ${w}x${h} @ ${Math.round(Rb.res)} m`);
+    const [red] = await Rb.img.readRasters({window:win});
+    const [nir] = await Nb.img.readRasters({window:win});
+    // hex centers in UTM + bucket for assignment
+    const centers = HEX.map(hx => toUTM(hx.lat, hx.lng));
+    const CB = new Map(); const ck=(i,j)=>i+"_"+j;
+    centers.forEach((c,i)=>{const k=ck(Math.floor(c[0]/520),Math.floor(c[1]/520)); if(!CB.has(k))CB.set(k,[]); CB.get(k).push(i);});
+    const sum = new Float64Array(HEX.length), cnt = new Uint32Array(HEX.length), dense = new Uint32Array(HEX.length);
+    for(let j=0;j<h;j++){
+      const Nn = oy - (win[1]+j+0.5)*Rb.res;
+      for(let i=0;i<w;i++){
+        const E = ox + (win[0]+i+0.5)*Rb.res;
+        const bi=Math.floor(E/520), bj=Math.floor(Nn/520);
+        let best=-1, bd=1e9;
+        for(let a=bi-1;a<=bi+1;a++) for(let b=bj-1;b<=bj+1;b++){
+          const ids=CB.get(ck(a,b)); if(!ids) continue;
+          for(const id of ids){ const d=Math.hypot(centers[id][0]-E, centers[id][1]-Nn); if(d<bd){bd=d;best=id;} }
+        }
+        if(best<0 || bd>HEXR) continue;   // circle-inscribed approximation of hex
+        const rr=red[j*w+i], nn=nir[j*w+i];
+        if(rr+nn===0) continue;
+        const nd=(nn-rr)/(nn+rr);
+        sum[best]+=nd; cnt[best]++; if(nd>=0.5) dense[best]++;
+      }
+      if(j % 200 === 0) setI("s2", "aggregating… "+Math.round(100*j/h)+"%");
+    }
+    HEX.forEach((hx,i)=>{ if(cnt[i]>5){ hx.ndvi=+(sum[i]/cnt[i]).toFixed(3); hx.dense=+(100*dense[i]/cnt[i]).toFixed(1);} });
+    const got = HEX.filter(h=>h.ndvi!==undefined).length;
+    setI("s2", `<span class=ok>NDVI for ${got} hexes (scene ${it.properties.datetime.slice(0,10)})</span>`, true);
+    window.__scene = it.id;
+  }catch(e){ setI("s2","failed: "+e); log("NDVI error: "+e); document.getElementById("b2").disabled=false; }
+}
+
+/* ================= manual TIFF reader (raw / deflate / LZW; predictor 1,2,3) ================= */
+function lzwDecode(inp, outLen){
+  const out = new Uint8Array(outLen);
+  let op=0, bitPos=0, width=9;
+  const CLEAR=256, EOI=257;
+  let dict=[], next=258, prev=null;
+  const reset=()=>{ dict=new Array(4096); for(let i=0;i<256;i++) dict[i]=[i]; next=258; width=9; prev=null; };
+  reset();
+  const read=()=>{ let v=0; for(let i=0;i<width;i++){ const byte=inp[bitPos>>3]; v=(v<<1)|((byte>>(7-(bitPos&7)))&1); bitPos++; } return v; };
+  while(op<outLen && (bitPos>>3) < inp.length){
+    const code = read();
+    if(code===EOI) break;
+    if(code===CLEAR){ reset(); continue; }
+    let entry;
+    if(dict[code]) entry = dict[code];
+    else if(code===next && prev) entry = prev.concat(prev[0]);
+    else break;
+    for(let i=0;i<entry.length && op<outLen;i++) out[op++]=entry[i];
+    if(prev){ dict[next++] = prev.concat(entry[0]); if(next===(1<<width)-1 && width<12) width++; }
+    prev = entry;
+  }
+  return out;
+}
+async function inflate(u8){
+  const ds = new DecompressionStream(u8[0]===0x78 ? "deflate" : "deflate-raw");
+  const st = new Blob([u8]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(st).arrayBuffer());
+}
+function undoPredictor(bytes, w, bpp, pred){
+  if(pred===2){ // horizontal differencing on samples (assume 1 sample; int types)
+    for(let row=0; row*w*bpp < bytes.length; row++){
+      const off=row*w*bpp;
+      for(let i=1;i<w;i++) for(let b=0;b<bpp;b++) bytes[off+i*bpp+b]=(bytes[off+i*bpp+b]+bytes[off+(i-1)*bpp+b])&255;
+    }
+  }else if(pred===3){ // floating point predictor
+    const rowB = w*bpp;
+    for(let row=0; row*rowB < bytes.length; row++){
+      const off=row*rowB;
+      for(let i=1;i<rowB;i++) bytes[off+i]=(bytes[off+i]+bytes[off+i-1])&255;
+      const tmp = bytes.slice(off, off+rowB);
+      for(let i=0;i<w;i++) for(let b=0;b<bpp;b++) bytes[off+i*bpp+b] = tmp[b*w+i]; // big-endian order
+    }
+    return "be";
+  }
+  return "le";
+}
+async function parseTiff(buf){
+  const dv = new DataView(buf);
+  const le = dv.getUint16(0)===0x4949;
+  if(dv.getUint16(2,le)!==42) throw new Error("not a classic TIFF");
+  let ifd = dv.getUint32(4,le);
+  const n = dv.getUint16(ifd,le);
+  const T = {};
+  for(let i=0;i<n;i++){
+    const o = ifd+2+i*12;
+    const tag=dv.getUint16(o,le), type=dv.getUint16(o+2,le), cnt=dv.getUint32(o+4,le);
+    const sz = {1:1,2:1,3:2,4:4,11:4,12:8}[type]||1;
+    const total = sz*cnt;
+    const ptr = total<=4 ? o+8 : dv.getUint32(o+8,le);
+    const get = k => type===3 ? dv.getUint16(ptr+k*2,le) : type===4 ? dv.getUint32(ptr+k*4,le)
+               : type===12 ? dv.getFloat64(ptr+k*8,le) : type===11 ? dv.getFloat32(ptr+k*4,le) : dv.getUint8(ptr+k);
+    T[tag] = cnt===1 ? get(0) : Array.from({length:cnt},(_,k)=>get(k));
+  }
+  const width=T[256], height=T[257], bits=[].concat(T[258])[0], comp=T[259]||1, pred=T[317]||1, sf=T[339]||1;
+  const bpp = bits/8;
+  const tiled = !!T[322];
+  const tw = tiled ? T[322] : width;
+  const th = tiled ? T[323] : (T[278]||height);
+  const offs = [].concat(tiled?T[324]:T[273]);
+  const cnts = [].concat(tiled?T[325]:T[279]);
+  const scale = T[33550], tie = T[33922];
+  const decodeBlock = async bi => {
+    const raw = new Uint8Array(buf, offs[bi], cnts[bi]);
+    let bytes;
+    if(comp===1) bytes = new Uint8Array(raw);           // copy
+    else if(comp===8||comp===32946) bytes = await inflate(raw);
+    else if(comp===5) bytes = lzwDecode(raw, tw*th*bpp);
+    else throw new Error("unsupported compression "+comp);
+    const endian = undoPredictor(bytes, tw, bpp, pred);
+    return {bytes, be: endian==="be"};
+  };
+  const cache = new Map();
+  const valueAt = async (col,row) => {
+    if(col<0||row<0||col>=width||row>=height) return NaN;
+    let bi, ix, iy;
+    if(tiled){
+      const tpr = Math.ceil(width/tw);
+      bi = Math.floor(row/th)*tpr + Math.floor(col/tw);
+      ix = col%tw; iy = row%th;
+    }else{
+      bi = Math.floor(row/th); ix = col; iy = row%th;
+    }
+    if(!cache.has(bi)) cache.set(bi, await decodeBlock(bi));
+    const {bytes, be} = cache.get(bi);
+    const dv2 = new DataView(bytes.buffer, bytes.byteOffset);
+    const off = (iy*tw+ix)*bpp;
+    if(off+bpp > bytes.length) return NaN;
+    if(bits===32 && sf===3) return dv2.getFloat32(off, !be && le);
+    if(bits===64 && sf===3) return dv2.getFloat64(off, !be && le);
+    if(bits===16) return sf===2 ? dv2.getInt16(off,le) : dv2.getUint16(off,le);
+    if(bits===8)  return bytes[off];
+    if(bits===32) return dv2.getUint32(off,le);
+    return NaN;
+  };
+  return {width, height, scale, tie, valueAt, nodata: parseFloat(T[42113]) };
+}
+
+/* ================= step 3: EEA rasters ================= */
+const laea = (lat, lon) => {
+  const a=6378137, e2=0.006694380022903416, e=Math.sqrt(e2);
+  const l0=10*Math.PI/180, p0=52*Math.PI/180, FE=4321000, FN=3210000;
+  const q = p => (1-e2)*(Math.sin(p)/(1-e2*Math.sin(p)**2) - (1/(2*e))*Math.log((1-e*Math.sin(p))/(1+e*Math.sin(p))));
+  const qp = q(Math.PI/2), b0 = Math.asin(q(p0)/qp), Rq = a*Math.sqrt(qp/2);
+  const p = lat*Math.PI/180, l = lon*Math.PI/180;
+  const b = Math.asin(q(p)/qp);
+  const D = (a*Math.cos(p0)/Math.sqrt(1-e2*Math.sin(p0)**2))/(Rq*Math.cos(b0));
+  const Bf = Rq*Math.sqrt(2/(1+Math.sin(b0)*Math.sin(b)+Math.cos(b0)*Math.cos(b)*Math.cos(l-l0)));
+  return [FE + Bf*D*Math.cos(b)*Math.sin(l-l0), FN + (Bf/D)*(Math.cos(b0)*Math.sin(b)-Math.sin(b0)*Math.cos(b)*Math.cos(l-l0))];
+};
+let eeaLoaded = [];
+async function handleEEA(file){
+  const name = file.name.toLowerCase();
+  const kind = /pm2/.test(name) ? "pm25" : /no2/.test(name) ? "no2" : null;
+  if(!kind){ log("EEA: can't classify "+file.name+" (needs pm25/no2 in name)"); return; }
+  log("EEA: reading "+file.name+" as "+kind+"…");
+  const tif = await parseTiff(await file.arrayBuffer());
+  const ox = tif.tie[3], oy = tif.tie[4], resx = tif.scale[0], resy = tif.scale[1];
+  let got = 0;
+  for(const hx of HEX){
+    const [X,Y] = laea(hx.lat, hx.lng);
+    const v = await tif.valueAt(Math.floor((X-ox)/resx), Math.floor((oy-Y)/resy));
+    if(isFinite(v) && v > -1e30){ hx[kind] = +v.toFixed(2); got++; }
+  }
+  eeaLoaded.push(kind);
+  setI("s3", `<span class=ok>${eeaLoaded.join(" + ")} loaded (${got} hexes)</span>`, true);
+  log("EEA "+kind+": values for "+got+" hexes");
+}
+
+/* ================= step 4: population ================= */
+async function handlePop(file){
+  log("population: reading "+file.name+"… (this may take a minute)");
+  const tif = await parseTiff(await file.arrayBuffer());
+  if(!tif.scale || tif.scale[0] > 0.01){ log("population: expected EPSG:4326 (degree pixels); got scale "+tif.scale); return; }
+  const ox = tif.tie[3], oy = tif.tie[4], rx = tif.scale[0], ry = tif.scale[1];
+  let got = 0, hi = 0;
+  for(let hIdx=0; hIdx<HEX.length; hIdx++){
+    const hx = HEX[hIdx];
+    // sum cells whose centers fall within hex (approx circle R)
+    const dLat = HEXR/KY, dLon = HEXR/KX;
+    const c0 = Math.floor((hx.lng-dLon-ox)/rx), c1 = Math.ceil((hx.lng+dLon-ox)/rx);
+    const r0 = Math.floor((oy-(hx.lat+dLat))/ry), r1 = Math.ceil((oy-(hx.lat-dLat))/ry);
+    let s = 0;
+    for(let r=r0;r<=r1;r++) for(let c=c0;c<=c1;c++){
+      const clat = oy-(r+0.5)*ry, clon = ox+(c+0.5)*rx;
+      const dx2 = (clon-hx.lng)*KX, dy2 = (clat-hx.lat)*KY;
+      if(!inHex(dx2, dy2)) continue;
+      const v = await tif.valueAt(c,r);
+      if(isFinite(v) && v>0 && v<1e6) s += v;
+    }
+    hx.pop = Math.round(s); got++;
+    if(s>hi) hi=s;
+    if(hIdx % 300 === 0) setI("s4","summing… "+Math.round(100*hIdx/HEX.length)+"%");
+  }
+  setI("s4", `<span class=ok>population for ${got} hexes (max ${hi.toFixed(0)})</span>`, true);
+  log("population done, max/hex "+hi.toFixed(0));
+}
+
+/* ================= step 5: compute + export ================= */
+function exportJSON(){
+  if(!ROADS){ log("run step 1 first (roads/parks needed)"); return; }
+  setI("s5","computing arterial & park metrics…");
+  setTimeout(()=>{
+    HEX.forEach((hx, idx) => {
+      // arterial exposure: fraction of 21 sample points within 75 m of a major road
+      let near=0, tot=0;
+      for(let dy=-240; dy<=240; dy+=120) for(let dx=-240; dx<=240; dx+=120){
+        if(!inHex(dx, dy)) continue;
+        tot++;
+        if(nearestSegDist(ROADS, hx.x+dx, hx.y+dy, 76) < 75) near++;
+      }
+      hx.art = tot ? +(100*near/tot).toFixed(1) : null;
+      hx.park = Math.round(nearestSegDist(PARKS, hx.x, hx.y, 2500));
+      if(idx % 400 === 0) setI("s5","computing… "+Math.round(100*idx/HEX.length)+"%");
+    });
+    const out = {
+      meta: {generated: new Date().toISOString(), hexR: HEXR, scene: window.__scene || null,
+        sources: "OSM/Overpass (ODbL); Copernicus Sentinel-2; EEA interpolated AQ 2024 CC-BY 4.0; WorldPop CC-BY 4.0",
+        fields: "lat,lng, ndvi (mean), dense (% NDVI>=0.5), pop (people/hex), art (% within 75m of arterial), park (m to nearest park>=1ha edge, capped 2500), pm25/no2 (annual ug/m3)"},
+      hexes: HEX.map(h => ({lat:h.lat, lng:h.lng, ndvi:h.ndvi??null, dense:h.dense??null,
+        pop:h.pop??null, art:h.art, park:h.park, pm25:h.pm25??null, no2:h.no2??null}))
+    };
+    const blob = new Blob([JSON.stringify(out)], {type:"application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "hexes.json";
+    document.body.appendChild(a); a.click(); a.remove();
+    setI("s5", "<span class=ok>hexes.json downloaded — "+HEX.length+" hexes</span>", true);
+    log("export done.");
+  }, 30);
+}
+
+/* ================= drop zones ================= */
+function wireDrop(id, handler){
+  const el = document.getElementById(id);
+  el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("over"); });
+  el.addEventListener("dragleave", () => el.classList.remove("over"));
+  el.addEventListener("drop", async e => {
+    e.preventDefault(); el.classList.remove("over");
+    for(const f of e.dataTransfer.files){
+      try{ await handler(f); }catch(err){ log(f.name+" failed: "+err); }
+    }
+  });
+}
+wireDrop("dropEEA", handleEEA);
+wireDrop("dropPop", handlePop);
+log("cooker ready. Start with step 0.");
+</script>
+</body>
+</html>
